@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
@@ -77,6 +79,78 @@ activities = {
     }
 }
 
+DAY_NAME_TO_INDEX = {
+    "monday": 0,
+    "mondays": 0,
+    "tuesday": 1,
+    "tuesdays": 1,
+    "wednesday": 2,
+    "wednesdays": 2,
+    "thursday": 3,
+    "thursdays": 3,
+    "friday": 4,
+    "fridays": 4,
+    "saturday": 5,
+    "saturdays": 5,
+    "sunday": 6,
+    "sundays": 6,
+}
+
+
+def parse_schedule(schedule_text: str):
+    """Parse a schedule string into weekday and minute ranges."""
+    schedule_text = schedule_text.strip()
+    match = re.match(
+        r"^(?P<days>.+),\s*(?P<start>\d{1,2}:\d{2}\s*(?:AM|PM))\s*-\s*(?P<end>\d{1,2}:\d{2}\s*(?:AM|PM))$",
+        schedule_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError(f"Invalid schedule format: {schedule_text}")
+
+    days_part = match.group("days")
+    start_time = datetime.strptime(match.group("start").upper(), "%I:%M %p")
+    end_time = datetime.strptime(match.group("end").upper(), "%I:%M %p")
+    if end_time <= start_time:
+        raise ValueError(f"Invalid schedule time range: {schedule_text}")
+
+    start_minutes = start_time.hour * 60 + start_time.minute
+    end_minutes = end_time.hour * 60 + end_time.minute
+
+    days = re.split(r"\s*(?:,|and)\s*", days_part)
+    parsed = []
+    for day in days:
+        normalized = day.strip().lower()
+        if normalized not in DAY_NAME_TO_INDEX:
+            raise ValueError(f"Invalid day name in schedule: {day}")
+        parsed.append((DAY_NAME_TO_INDEX[normalized], start_minutes, end_minutes))
+
+    return parsed
+
+
+def schedules_conflict(schedule_a, schedule_b):
+    for day_a, start_a, end_a in schedule_a:
+        for day_b, start_b, end_b in schedule_b:
+            if day_a != day_b:
+                continue
+            if start_a < end_b and start_b < end_a:
+                return True
+    return False
+
+
+def find_conflicting_activity(activity_name: str, student_email: str, new_schedule):
+    for existing_name, existing_activity in activities.items():
+        if existing_name == activity_name:
+            continue
+        if student_email not in existing_activity["participants"]:
+            continue
+
+        existing_schedule = parse_schedule(existing_activity["schedule"])
+        if schedules_conflict(new_schedule, existing_schedule):
+            return existing_name, existing_activity["schedule"]
+
+    return None, None
+
 
 @app.get("/")
 def root():
@@ -103,6 +177,27 @@ def signup_for_activity(activity_name: str, email: str):
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
+        )
+
+    # Check for schedule conflicts with existing enrollments
+    try:
+        new_schedule = parse_schedule(activity["schedule"])
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    conflicting_activity, conflicting_schedule = find_conflicting_activity(
+        activity_name,
+        email,
+        new_schedule,
+    )
+
+    if conflicting_activity:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Schedule conflict detected with '{conflicting_activity}' "
+                f"({conflicting_schedule}). Please choose a different activity or unregister first."
+            )
         )
 
     # Add student
